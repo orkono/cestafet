@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -89,29 +90,85 @@ var migrations = []string{
 	`ALTER TABLE sessions ADD COLUMN claude_started INTEGER NOT NULL DEFAULT 0;`,
 }
 
-func migrate(db *sql.DB) error {
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
+func isBusy(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "locked") || strings.Contains(s, "busy")
+}
+
+// enableWAL ensures the database uses WAL journaling. Switching a brand-new
+// database from rollback to WAL requires an exclusive lock and can briefly
+// return SQLITE_BUSY when hooks and the MCP server open it at the same time.
+func enableWAL(db *sql.DB) error {
+	var mode string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err == nil && strings.EqualFold(mode, "wal") {
+		return nil
 	}
-	for v := version; v < len(migrations); v++ {
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("migrate to %d: %w", v+1, err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&mode)
+		if err == nil {
+			return nil
 		}
-		if _, err := tx.Exec(migrations[v]); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("migrate to %d: %w", v+1, err)
+		if !isBusy(err) || time.Now().After(deadline) {
+			return fmt.Errorf("enable wal: %w", err)
 		}
-		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("migrate to %d: %w", v+1, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("migrate to %d: %w", v+1, err)
-		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+// withImmediateTx runs fn inside a BEGIN IMMEDIATE transaction on a dedicated
+// connection so concurrent readers cannot observe intermediate state or race
+// on a deferred read-to-write lock upgrade.
+func withImmediateTx(db *sql.DB, fn func(*sql.Conn) error) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	if err := fn(conn); err != nil {
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
+}
+
+// initSchema applies the base schema and any pending migrations atomically
+// under BEGIN IMMEDIATE so concurrent first opens never race on ALTER TABLE.
+func initSchema(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err == nil && version >= len(migrations) {
+		return nil
+	}
+	return withImmediateTx(db, func(conn *sql.Conn) error {
+		ctx := context.Background()
+		var v int
+		if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil {
+			return fmt.Errorf("read schema version: %w", err)
+		}
+		if v >= len(migrations) {
+			return nil
+		}
+		if _, err := conn.ExecContext(ctx, schema); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
+		for ; v < len(migrations); v++ {
+			if _, err := conn.ExecContext(ctx, migrations[v]); err != nil {
+				return fmt.Errorf("migrate to %d: %w", v+1, err)
+			}
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
+				return fmt.Errorf("migrate to %d: %w", v+1, err)
+			}
+		}
+		return nil
+	})
 }
 
 // DefaultPath returns the database location: $CESTAFET_DB, else
@@ -155,11 +212,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if err := enableWAL(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
+		return nil, err
 	}
-	if err := migrate(db); err != nil {
+	if err := initSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -179,7 +236,7 @@ func fileURI(path string) (string, error) {
 		p = "/" + p // C:/Users/... → /C:/Users/...
 	}
 	u := url.URL{Scheme: "file", Path: p,
-		RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"}
+		RawQuery: "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"}
 	return u.String(), nil
 }
 

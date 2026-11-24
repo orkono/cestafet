@@ -1,11 +1,14 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -379,5 +382,197 @@ func TestOpenPathWithSpecialCharacters(t *testing.T) {
 	}
 	if fi, err := os.Stat(path); err != nil || fi.Size() == 0 {
 		t.Fatalf("database at %q: %v", path, err)
+	}
+}
+
+func TestConcurrentOpenMigratesCleanly(t *testing.T) {
+	openConcurrently := func(t *testing.T, path string) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		start := make(chan struct{})
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				st, err := Open(path)
+				if err != nil {
+					errs <- err
+					return
+				}
+				_ = st.Close()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("concurrent Open(%q): %v", path, err)
+		}
+	}
+
+	// Brand-new database opened simultaneously (e.g. MCP server + SessionStart hook).
+	for i := 0; i < 5; i++ {
+		openConcurrently(t, filepath.Join(t.TempDir(), "bus.db"))
+	}
+
+	// Legacy v0.1.0 database upgraded simultaneously by several processes.
+	legacy := filepath.Join(t.TempDir(), "legacy.db")
+	dsn, err := fileURI(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE notices (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, from_session TEXT NOT NULL,
+		from_profile TEXT NOT NULL, from_role TEXT NOT NULL, origin TEXT NOT NULL, prompt_id INTEGER,
+		body TEXT NOT NULL, created_at INTEGER NOT NULL);`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	openConcurrently(t, legacy)
+}
+
+func TestTakePendingWithinDeliversOnceConcurrently(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bus.db")
+	s0, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s0.Close()
+	from := register(t, s0, "coord", "proj")
+	register(t, s0, "worker", "proj")
+
+	handles := make([]*Store, 4)
+	for i := range handles {
+		h, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		handles[i] = h
+	}
+
+	for round := 0; round < 20; round++ {
+		if _, _, err := s0.Send(NewNotice{From: from, Origin: OriginAgent, Body: "hold deploys"}); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var delivered atomic.Int32
+		errs := make(chan error, len(handles))
+		start := make(chan struct{})
+		for _, h := range handles {
+			wg.Add(1)
+			go func(st *Store) {
+				defer wg.Done()
+				<-start
+				got, _, err := st.TakePendingWithin("worker", 12*1024)
+				if err != nil {
+					errs <- err
+					return
+				}
+				delivered.Add(int32(len(got)))
+			}(h)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if n := delivered.Load(); n != 1 {
+			t.Fatalf("round %d: delivered %d times, want 1", round, n)
+		}
+	}
+}
+
+func TestRegisterDropsCoordinatorOnProjectChange(t *testing.T) {
+	s := newStore(t)
+	if _, err := s.Register(Session{ID: "coordA", ClaudePID: 10, Profile: "p1", Project: "projA", Cwd: "/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(Session{ID: "coordB", ClaudePID: 20, Profile: "p2", Project: "projB", Cwd: "/b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MakeCoordinator("coordA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MakeCoordinator("coordB"); err != nil {
+		t.Fatal(err)
+	}
+	// Refreshing coordA in another project (cd or projects.toml change) must drop its coordinator role.
+	if isNew, err := s.Register(Session{ID: "coordA", ClaudePID: 10, Profile: "p1", Project: "projB", Cwd: "/b"}); err != nil || isNew {
+		t.Fatalf("refresh: new=%v err=%v", isNew, err)
+	}
+	gotA, _ := s.Get("coordA")
+	if gotA.Project != "projB" || gotA.Role != RoleMember {
+		t.Fatalf("coordA after project switch = %+v, want projB member", gotA)
+	}
+	c, err := s.Coordinator("projB")
+	if err != nil || c.ID != "coordB" {
+		t.Fatalf("projB coordinator = %+v, %v; want coordB", c, err)
+	}
+}
+
+func TestSupersedeDoesNotCarryCoordinatorAcrossProjects(t *testing.T) {
+	s := newStore(t)
+	if _, err := s.Register(Session{ID: "oldA", ClaudePID: 30, ClaudeStarted: 1000, Profile: "p1", Project: "projA", Cwd: "/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(Session{ID: "coordB", ClaudePID: 40, ClaudeStarted: 1000, Profile: "p2", Project: "projB", Cwd: "/b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MakeCoordinator("oldA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MakeCoordinator("coordB"); err != nil {
+		t.Fatal(err)
+	}
+	// Same process starts a new session in projB: oldA is retired, role does not move into projB.
+	if _, err := s.Register(Session{ID: "newB", ClaudePID: 30, ClaudeStarted: 1000, Profile: "p1", Project: "projB", Cwd: "/b"}); err != nil {
+		t.Fatal(err)
+	}
+	if old, _ := s.Get("oldA"); old.Status != StatusGone || old.Role != RoleMember {
+		t.Fatalf("oldA = %+v, want gone member", old)
+	}
+	if got, _ := s.Get("newB"); got.Role != RoleMember {
+		t.Fatalf("newB inherited coordinator across projects: %+v", got)
+	}
+	if c, err := s.Coordinator("projB"); err != nil || c.ID != "coordB" {
+		t.Fatalf("projB coordinator = %+v, %v; want coordB", c, err)
+	}
+}
+
+func TestResumeSupersedesPreviousSessionOnSamePID(t *testing.T) {
+	s := newStore(t)
+	if _, err := s.Register(Session{ID: "earlier", ClaudePID: 50, ClaudeStarted: 1000, Profile: "p", Project: "proj", Cwd: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.End("earlier"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Register(Session{ID: "current", ClaudePID: 50, ClaudeStarted: 1000, Profile: "p", Project: "proj", Cwd: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MakeCoordinator("current"); err != nil {
+		t.Fatal(err)
+	}
+	// Resuming the earlier session id in the same claude process must retire "current"
+	// and keep the coordinator role in the same project.
+	if isNew, err := s.Register(Session{ID: "earlier", ClaudePID: 50, ClaudeStarted: 1000, Profile: "p", Project: "proj", Cwd: "/w"}); err != nil || isNew {
+		t.Fatalf("resume: new=%v err=%v", isNew, err)
+	}
+	if cur, _ := s.Get("current"); cur.Status != StatusGone || cur.Role != RoleMember {
+		t.Fatalf("superseded session = %+v, want gone member", cur)
+	}
+	if res, _ := s.Get("earlier"); res.Status != StatusLive || res.Role != RoleCoordinator {
+		t.Fatalf("resumed session = %+v, want live coordinator", res)
+	}
+	if got, err := s.ByOwner(50, 1000); err != nil || got.ID != "earlier" {
+		t.Fatalf("ByOwner = %+v, %v; want earlier", got, err)
 	}
 }

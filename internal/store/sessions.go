@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -67,56 +68,64 @@ func (s *Store) effectiveStatus(sess Session) Session {
 	return sess
 }
 
-// Register inserts a session or refreshes it. Summary and role survive a
-// re-registration (resume, /clear) of the same session id. It reports whether
-// the session is new.
+// Register inserts a session or refreshes it. Summary survives a
+// re-registration (resume, /clear) of the same session id, and role survives
+// while the session stays in the same project. It reports whether the session
+// is new.
 func (s *Store) Register(in Session) (bool, error) {
 	now := s.unix()
-	res, err := s.db.Exec(`
-		INSERT INTO sessions (`+sessionCols+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING`,
-		in.ID, in.ClaudePID, in.Profile, in.Project, in.Repo, in.Cwd, in.Branch,
-		RoleMember, StatusLive, now, now, in.ClaudeStarted)
-	if err != nil {
-		return false, fmt.Errorf("insert session: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		return true, s.supersede(in.ID, in.ClaudePID, in.ClaudeStarted)
-	}
-	_, err = s.db.Exec(`
-		UPDATE sessions SET claude_pid = ?, claude_started = ?, profile = ?, project = ?, repo = ?, cwd = ?,
-			branch = ?, status = ?, last_seen = ?
-		WHERE id = ?`,
-		in.ClaudePID, in.ClaudeStarted, in.Profile, in.Project, in.Repo, in.Cwd, in.Branch, StatusLive, now, in.ID)
-	if err != nil {
-		return false, fmt.Errorf("refresh session: %w", err)
-	}
-	return false, nil
+	var isNew bool
+	err := withImmediateTx(s.db, func(conn *sql.Conn) error {
+		ctx := context.Background()
+		res, err := conn.ExecContext(ctx, `
+			INSERT INTO sessions (`+sessionCols+`)
+			VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO NOTHING`,
+			in.ID, in.ClaudePID, in.Profile, in.Project, in.Repo, in.Cwd, in.Branch,
+			RoleMember, StatusLive, now, now, in.ClaudeStarted)
+		if err != nil {
+			return fmt.Errorf("insert session: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			isNew = true
+			return supersede(ctx, conn, in.ID, in.Project, in.ClaudePID, in.ClaudeStarted)
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE sessions SET claude_pid = ?, claude_started = ?, profile = ?, project = ?, repo = ?, cwd = ?,
+				branch = ?, role = CASE WHEN project = ? THEN role ELSE ? END, status = ?, last_seen = ?
+			WHERE id = ?`,
+			in.ClaudePID, in.ClaudeStarted, in.Profile, in.Project, in.Repo, in.Cwd, in.Branch,
+			in.Project, RoleMember, StatusLive, now, in.ID); err != nil {
+			return fmt.Errorf("refresh session: %w", err)
+		}
+		return supersede(ctx, conn, in.ID, in.Project, in.ClaudePID, in.ClaudeStarted)
+	})
+	return isNew, err
 }
 
-// supersede handles a claude process that switched to a new session id
-// (/clear, a new conversation in the same process): the earlier sessions of
-// that pid are marked gone, and the newest one's coordinator role moves to the
-// new id only when it belonged to the same process (same creation time where
-// known). A claude process runs one session at a time; a session of an earlier
-// process that died and whose pid was reused is retired without its role.
-func (s *Store) supersede(newID string, pid int, started int64) error {
+// supersede handles a claude process that switched to a different session id
+// (/clear, /resume, or a new conversation in the same process): the earlier
+// sessions of that pid are marked gone, and the newest one's coordinator role
+// moves to the new id only when it belonged to the same process (same creation
+// time where known) and the same project. A claude process runs one session at
+// a time; a session of an earlier process that died and whose pid was reused is
+// retired without its role.
+func supersede(ctx context.Context, conn *sql.Conn, newID, project string, pid int, started int64) error {
 	if pid <= 0 {
 		return nil
 	}
-	var role string
-	err := s.db.QueryRow(`SELECT role FROM sessions WHERE `+sameOwner+` AND id != ? AND status != ?
-		ORDER BY last_seen DESC LIMIT 1`, pid, started, started, newID, StatusGone).Scan(&role)
+	var role, prevProject string
+	err := conn.QueryRowContext(ctx, `SELECT role, project FROM sessions WHERE `+sameOwner+` AND id != ? AND status != ?
+		ORDER BY last_seen DESC LIMIT 1`, pid, started, started, newID, StatusGone).Scan(&role, &prevProject)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("find superseded session: %w", err)
 	}
-	if _, err := s.db.Exec(`UPDATE sessions SET status = ?, role = ? WHERE claude_pid = ? AND id != ? AND status != ?`,
+	if _, err := conn.ExecContext(ctx, `UPDATE sessions SET status = ?, role = ? WHERE claude_pid = ? AND id != ? AND status != ?`,
 		StatusGone, RoleMember, pid, newID, StatusGone); err != nil {
 		return fmt.Errorf("retire superseded sessions: %w", err)
 	}
-	if role == RoleCoordinator {
-		if _, err := s.db.Exec(`UPDATE sessions SET role = ? WHERE id = ?`, RoleCoordinator, newID); err != nil {
+	if role == RoleCoordinator && prevProject == project {
+		if _, err := conn.ExecContext(ctx, `UPDATE sessions SET role = ? WHERE id = ?`, RoleCoordinator, newID); err != nil {
 			return fmt.Errorf("carry coordinator role: %w", err)
 		}
 	}
@@ -251,27 +260,34 @@ func (s *Store) Coordinator(project string) (Session, error) {
 // MakeCoordinator gives the session the coordinator role of its project and
 // returns the previous coordinator's id ("" if none).
 func (s *Store) MakeCoordinator(id string) (string, error) {
-	sess, err := s.Get(id)
-	if err != nil {
-		return "", err
-	}
-	prev := ""
-	if c, err := s.Coordinator(sess.Project); err == nil && c.ID != id {
-		prev = c.ID
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return "", fmt.Errorf("begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`UPDATE sessions SET role = ? WHERE project = ? AND role = ?`,
-		RoleMember, sess.Project, RoleCoordinator); err != nil {
-		return "", fmt.Errorf("clear coordinator: %w", err)
-	}
-	if _, err := tx.Exec(`UPDATE sessions SET role = ? WHERE id = ?`, RoleCoordinator, id); err != nil {
-		return "", fmt.Errorf("set coordinator: %w", err)
-	}
-	return prev, tx.Commit()
+	var prev string
+	err := withImmediateTx(s.db, func(conn *sql.Conn) error {
+		ctx := context.Background()
+		var project string
+		if err := conn.QueryRowContext(ctx, `SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("get session: %w", err)
+		}
+		var prevID string
+		err := conn.QueryRowContext(ctx, `SELECT id FROM sessions WHERE project = ? AND role = ? AND status != ? LIMIT 1`,
+			project, RoleCoordinator, StatusGone).Scan(&prevID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("get coordinator: %w", err)
+		}
+		if err == nil && prevID != id {
+			prev = prevID
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE sessions SET role = ? WHERE project = ? AND role = ?`,
+			RoleMember, project, RoleCoordinator); err != nil {
+			return fmt.Errorf("clear coordinator: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE sessions SET role = ? WHERE id = ?`, RoleCoordinator, id); err != nil {
+			return fmt.Errorf("set coordinator: %w", err)
+		}
+		return nil
+	})
+	return prev, err
 }
 
 // SetSummary records what the session is working on.

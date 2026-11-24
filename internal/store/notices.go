@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -216,23 +217,46 @@ func (s *Store) TakePending(sessionID string) ([]Notice, error) {
 // how many are left for a later hook. At least one notice is always returned
 // when any is pending, so a single large notice can never stall delivery.
 func (s *Store) TakePendingWithin(sessionID string, maxBytes int) ([]Notice, int, error) {
-	rows, err := s.db.Query(`SELECT `+noticeCols+` FROM deliveries d
-		JOIN notices n ON n.id = d.notice_id
-		LEFT JOIN prompts p ON p.id = n.prompt_id
-		WHERE d.to_session = ? AND d.delivered_at IS NULL ORDER BY n.id`, sessionID)
+	// Fast path: avoid taking a write lock when nothing is pending (the common PostToolUse case).
+	var has int
+	if err := s.db.QueryRow(`SELECT 1 FROM deliveries WHERE to_session = ? AND delivered_at IS NULL LIMIT 1`,
+		sessionID).Scan(&has); errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, nil
+	} else if err != nil {
+		return nil, 0, fmt.Errorf("check pending notices: %w", err)
+	}
+
+	var take []Notice
+	var left int
+	err := withImmediateTx(s.db, func(conn *sql.Conn) error {
+		ctx := context.Background()
+		rows, err := conn.QueryContext(ctx, `SELECT `+noticeCols+` FROM deliveries d
+			JOIN notices n ON n.id = d.notice_id
+			LEFT JOIN prompts p ON p.id = n.prompt_id
+			WHERE d.to_session = ? AND d.delivered_at IS NULL ORDER BY n.id`, sessionID)
+		if err != nil {
+			return fmt.Errorf("pending notices: %w", err)
+		}
+		notices, err := scanNotices(rows)
+		if err != nil || len(notices) == 0 {
+			return err
+		}
+		take = fitting(notices, maxBytes)
+		left = len(notices) - len(take)
+		now := s.unix()
+		for _, n := range take {
+			if _, err := conn.ExecContext(ctx,
+				`UPDATE deliveries SET delivered_at = ? WHERE notice_id = ? AND to_session = ? AND delivered_at IS NULL`,
+				now, n.ID, sessionID); err != nil {
+				return fmt.Errorf("mark delivered: %w", err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("pending notices: %w", err)
+		return nil, 0, err
 	}
-	notices, err := scanNotices(rows)
-	if err != nil || len(notices) == 0 {
-		return notices, 0, err
-	}
-	take := fitting(notices, maxBytes)
-	if _, err := s.db.Exec(`UPDATE deliveries SET delivered_at = ? WHERE to_session = ? AND delivered_at IS NULL
-		AND notice_id <= ?`, s.unix(), sessionID, take[len(take)-1].ID); err != nil {
-		return nil, 0, fmt.Errorf("mark delivered: %w", err)
-	}
-	return take, len(notices) - len(take), nil
+	return take, left, nil
 }
 
 // fitting returns the longest prefix of notices within maxBytes, never empty.
