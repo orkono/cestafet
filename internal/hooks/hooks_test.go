@@ -275,3 +275,25 @@ func TestGuardAsksBeforeAMatchingCommand(t *testing.T) {
 		t.Fatalf("lifted rule still guards: %+v", o)
 	}
 }
+
+func TestPostToolIgnoresArbitraryToolInputShapes(t *testing.T) {
+	app := newApp(t)
+	fire(t, app, "session-start", `{"session_id":"coord","cwd":"/w/app"}`, 1)
+	fire(t, app, "session-start", `{"session_id":"busy","cwd":"/w/app"}`, 2)
+	coord, _ := app.Store.Get("coord")
+
+	payloads := []string{
+		`{"session_id":"busy","cwd":"/w/app","tool_name":"mcp__docker__exec","tool_input":{"command":["npm","test"]}}`,
+		`{"session_id":"busy","cwd":"/w/app","tool_name":"mcp__custom__run","tool_input":{"command":{"bin":"make"}}}`,
+		`{"session_id":"busy","cwd":"/w/app","tool_name":"mcp__custom__raw","tool_input":"plain string"}`,
+	}
+	for i, payload := range payloads {
+		body := "notice #" + strconv.Itoa(i)
+		if _, _, err := app.Store.Send(store.NewNotice{From: coord, Origin: store.OriginAgent, Body: body}); err != nil {
+			t.Fatal(err)
+		}
+		if ctx := fire(t, app, "post-tool", payload, 2); !strings.Contains(ctx, body) {
+			t.Fatalf("payload %s did not deliver notice: %q", payload, ctx)
+		}
+	}
+}

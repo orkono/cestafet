@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,7 +15,11 @@ import (
 // project's rules in force. It returns the reason to ask the user with, or ""
 // to let the command run. It never denies: the user decides.
 func guardReason(app *core.App, in Input) (string, error) {
-	if !shellTool(in.ToolName) || strings.TrimSpace(in.ToolInput.Command) == "" {
+	if !shellTool(in.ToolName) {
+		return "", nil
+	}
+	cmd := toolCommand(in.ToolInput)
+	if strings.TrimSpace(cmd) == "" {
 		return "", nil
 	}
 	sess, err := app.Store.Get(in.SessionID)
@@ -30,12 +35,25 @@ func guardReason(app *core.App, in Input) (string, error) {
 	}
 	for _, r := range rules {
 		for _, p := range r.Guards {
-			if guard.Match(p, in.ToolInput.Command) {
+			if guard.Match(p, cmd) {
 				return reason(r, p), nil
 			}
 		}
 	}
 	return "", nil
+}
+
+func toolCommand(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return ""
+	}
+	return in.Command
 }
 
 // shellTool reports whether a tool runs shell commands: Bash, and PowerShell

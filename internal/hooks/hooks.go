@@ -22,11 +22,10 @@ type Input struct {
 	// AgentID is set when the tool call was made by a subagent. Its context is
 	// not the main conversation's, so notices are held for the main agent.
 	AgentID string `json:"agent_id"`
-	// PreToolUse
-	ToolName  string `json:"tool_name"`
-	ToolInput struct {
-		Command string `json:"command"`
-	} `json:"tool_input"`
+	// PreToolUse (kept raw so PostToolUse — matcher "*" — never fails when another
+	// tool's tool_input has a non-string "command" field or non-object shape).
+	ToolName  string          `json:"tool_name"`
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 type specificOutput struct {
