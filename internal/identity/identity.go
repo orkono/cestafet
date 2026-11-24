@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -66,42 +65,68 @@ func LookupRepo(dir string) Repo {
 
 // NormalizeRemote turns a git remote URL into "host/owner/repo". SSH host
 // aliases (e.g. "github-work" from ~/.ssh/config) are resolved through resolve.
-func NormalizeRemote(url string, resolve func(alias string) string) string {
-	u := strings.TrimSpace(url)
-	u = strings.TrimSuffix(u, "/")
+func NormalizeRemote(raw string, resolve func(alias string) string) string {
+	u := strings.TrimSpace(raw)
+	u = strings.TrimRight(u, "/")
 	u = strings.TrimSuffix(u, ".git")
-	for _, scheme := range []string{"https://", "http://", "ssh://", "git://", "git+ssh://"} {
-		u = strings.TrimPrefix(u, scheme)
+	u = strings.TrimRight(u, "/")
+
+	var host, path string
+	var parsed bool
+	if idx := strings.Index(u, "://"); idx >= 0 {
+		switch strings.ToLower(u[:idx]) {
+		case "https", "http", "ssh", "git", "git+ssh":
+			parsed = true
+			rest := u[idx+3:]
+			authority := rest
+			if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+				authority, path = rest[:slash], strings.TrimLeft(rest[slash+1:], "/")
+			}
+			// Strip optional user or user:pass credentials from authority.
+			if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+				authority = authority[at+1:]
+			}
+			host = stripPort(authority)
+		}
 	}
-	if at := strings.Index(u, "@"); at >= 0 && at < strings.IndexAny(u+":/", ":/") {
-		u = u[at+1:]
+	if !parsed {
+		// SCP-like syntax: [user@]host:path (or bare host/path).
+		if i := strings.IndexAny(u, ":/"); i >= 0 {
+			host, path = u[:i], strings.TrimLeft(u[i+1:], "/")
+		} else {
+			host = u
+		}
+		if at := strings.LastIndexByte(host, '@'); at >= 0 {
+			host = host[at+1:]
+		}
 	}
-	host, path := u, ""
-	if i := strings.IndexAny(u, ":/"); i >= 0 {
-		host, path = u[:i], strings.TrimLeft(u[i+1:], "/")
-	}
-	if colon := strings.Index(host, ":"); colon >= 0 { // host:port
-		host = host[:colon]
-	}
-	if !strings.Contains(host, ".") && resolve != nil {
+	if host != "" && !strings.Contains(host, ".") && resolve != nil {
 		if real := resolve(host); real != "" {
 			host = real
 		}
 	}
-	// a numeric port left in the path by "ssh://host:22/owner/repo"
-	if first, rest, ok := strings.Cut(path, "/"); ok {
-		if _, err := strconv.Atoi(first); err == nil {
-			path = rest
-		}
-	}
 	return strings.ToLower(host) + "/" + path
+}
+
+// stripPort removes an explicit :port from a URL authority (keeping IPv6 [::1]).
+func stripPort(authority string) string {
+	if strings.HasPrefix(authority, "[") {
+		if end := strings.IndexByte(authority, ']'); end >= 0 {
+			return authority[:end+1]
+		}
+		return authority
+	}
+	if colon := strings.IndexByte(authority, ':'); colon >= 0 {
+		return authority[:colon]
+	}
+	return authority
 }
 
 // sshHostname resolves an ~/.ssh/config alias to its real host name.
 func sshHostname(alias string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
-	out, err := Quiet(exec.CommandContext(ctx, "ssh", "-G", alias)).Output()
+	out, err := Quiet(exec.CommandContext(ctx, "ssh", "-G", "--", alias)).Output()
 	if err != nil {
 		return ""
 	}

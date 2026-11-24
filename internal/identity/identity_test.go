@@ -13,12 +13,19 @@ func TestNormalizeRemote(t *testing.T) {
 		return ""
 	}
 	cases := map[string]string{
-		"git@github.com:orkono/cestafet.git":          "github.com/orkono/cestafet",
-		"https://github.com/orkono/cestafet":          "github.com/orkono/cestafet",
-		"https://user@GitHub.com/orkono/cestafet.git": "github.com/orkono/cestafet",
-		"ssh://git@gitlab.example.com:22/team/app":    "gitlab.example.com/team/app",
-		"git@github-work:orkono/cestafet.git":         "github.com/orkono/cestafet",
-		"git@unknown-alias:team/app.git":              "unknown-alias/team/app",
+		"git@github.com:orkono/cestafet.git":                           "github.com/orkono/cestafet",
+		"https://github.com/orkono/cestafet":                           "github.com/orkono/cestafet",
+		"https://user@GitHub.com/orkono/cestafet.git":                  "github.com/orkono/cestafet",
+		"https://user:ghp_secret123@github.com/orkono/cestafet.git":    "github.com/orkono/cestafet",
+		"https://oauth2:glpat-secret@gitlab.example.com:8443/team/app": "gitlab.example.com/team/app",
+		"https://github.com/12345/myrepo.git":                          "github.com/12345/myrepo",
+		"git@gitlab.com:42/myrepo.git":                                 "gitlab.com/42/myrepo",
+		"ssh://git@gitlab.example.com:22/42/app.git":                   "gitlab.example.com/42/app",
+		"ssh://git@gitlab.example.com:22/team/app":                     "gitlab.example.com/team/app",
+		"ssh://git@github-work:22/orkono/cestafet.git":                 "github.com/orkono/cestafet",
+		"HTTPS://GitHub.com/orkono/cestafet.git//":                     "github.com/orkono/cestafet",
+		"git@github-work:orkono/cestafet.git":                          "github.com/orkono/cestafet",
+		"git@unknown-alias:team/app.git":                               "unknown-alias/team/app",
 	}
 	for in, want := range cases {
 		if got := NormalizeRemote(in, resolve); got != want {
